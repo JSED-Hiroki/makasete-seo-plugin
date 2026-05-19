@@ -3,7 +3,7 @@
  * Plugin Name:       Makasete SEO
  * Plugin URI:        https://makasete.app
  * Description:       Connects your WordPress site to the Makasete AI SEO automation platform. Enables automated creation, editing, and management of posts, categories, tags, and media.
- * Version:           1.7.4
+ * Version:           1.8.2
  * Author:            Makasete
  * License:           GPL-2.0+
  * Text Domain:       makasete-seo
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'MAKASETE_VERSION', '1.7.4' );
+define( 'MAKASETE_VERSION', '1.8.2' );
 define( 'MAKASETE_PLUGIN_FILE', __FILE__ );
 define( 'MAKASETE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MAKASETE_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );

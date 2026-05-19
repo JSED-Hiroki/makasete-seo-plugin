@@ -171,6 +171,21 @@ class Makasete_REST_Controller {
             'permission_callback' => [ $this, 'can_read' ],
         ] );
 
+        // ── Plugin management ────────────────────────────────────────────────
+        register_rest_route( self::REST_NAMESPACE, '/plugin/self-update', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ $this, 'self_update_plugin' ],
+            'permission_callback' => [ $this, 'can_manage_plugin' ],
+            'args'                => [
+                'download_url' => [
+                    'required'          => true,
+                    'type'              => 'string',
+                    'format'            => 'uri',
+                    'sanitize_callback' => 'esc_url_raw',
+                ],
+            ],
+        ] );
+
         // ── Posts ────────────────────────────────────────────────────────────
         register_rest_route( self::REST_NAMESPACE, '/posts', [
             [
@@ -224,6 +239,29 @@ class Makasete_REST_Controller {
             'permission_callback' => [ $this, 'can_edit_post' ],
             'args'                => [
                 'sticky' => [ 'required' => true, 'type' => 'boolean' ],
+            ],
+        ] );
+
+        // Status flip route. Registered for BOTH POST and PATCH so that
+        // hosting WAFs which reject WebDAV-style methods (PUT, PATCH, COPY,
+        // MOVE — ConoHa Wing's "WebDAVなどで利用するメソッドの拒否" rule
+        // is the canonical example) don't strand the user with no way to
+        // un-publish their own post. The Makasete backend prefers POST
+        // for the same reason — POST is universally allowed by managed-host
+        // method allow-lists. Both verbs run the same handler and the same
+        // ``can_change_post_status`` capability check, so security is
+        // unchanged.
+        register_rest_route( self::REST_NAMESPACE, '/posts/(?P<id>[\d]+)/status', [
+            'methods'             => 'POST, PATCH',
+            'callback'            => [ $this, 'update_post_status' ],
+            'permission_callback' => [ $this, 'can_change_post_status' ],
+            'args'                => [
+                'status' => [
+                    'required'          => true,
+                    'type'              => 'string',
+                    'enum'              => self::ALLOWED_STATUSES,
+                    'sanitize_callback' => 'sanitize_key',
+                ],
             ],
         ] );
 
@@ -503,6 +541,24 @@ class Makasete_REST_Controller {
         return current_user_can( 'edit_post', $id ) ? true : $this->forbidden();
     }
 
+    /**
+     * Status-flip permission: requires only `publish_posts`.
+     *
+     * `can_edit_post` checks the `edit_post` meta-cap which, for already-published
+     * posts, maps to `edit_published_posts`. Custom WordPress roles or restricted
+     * configurations can grant `publish_posts` without `edit_published_posts`,
+     * causing a spurious 403 when a user tries to un-publish their own post.
+     * Because toggling publish/draft is a publishing action, not a content-editing
+     * one, `publish_posts` is the correct capability to gate it on.
+     */
+    public function can_change_post_status( WP_REST_Request $request ): bool|WP_Error {
+        return current_user_can( 'publish_posts' ) ? true : $this->forbidden();
+    }
+
+    public function can_manage_plugin( WP_REST_Request $request ): bool|WP_Error {
+        return current_user_can( 'activate_plugins' ) ? true : $this->forbidden();
+    }
+
     private function forbidden( string $message = '' ): WP_Error {
         return new WP_Error(
             'rest_forbidden',
@@ -726,8 +782,12 @@ class Makasete_REST_Controller {
 
     /**
      * Write SEO title / meta description to the detected SEO plugin's meta keys,
-     * in addition to our own `_makasete_*` keys. Safe to call with empty values —
-     * empty strings are not written so manual WP-admin edits are preserved.
+     * in addition to our own `_makasete_*` keys. Pass `null` to skip an
+     * individual field (e.g. preserving manual WP-admin edits during the
+     * publisher's initial create); pass an explicit string — including the
+     * empty string — to overwrite it (e.g. when the user clears the field
+     * in the editor sidebar). Callers decide which semantic they want via
+     * the value they pass; this function honours the request as-is.
      */
     private function sync_seo_meta( int $post_id, ?string $seo_title, ?string $meta_description ): void {
         $plugin = $this->detect_seo_plugin();
@@ -744,10 +804,10 @@ class Makasete_REST_Controller {
             'rankmath' => 'rank_math_description',
         ];
 
-        if ( is_string( $seo_title ) && $seo_title !== '' ) {
+        if ( is_string( $seo_title ) ) {
             update_post_meta( $post_id, $title_keys[ $plugin ], $seo_title );
         }
-        if ( is_string( $meta_description ) && $meta_description !== '' ) {
+        if ( is_string( $meta_description ) ) {
             update_post_meta( $post_id, $desc_keys[ $plugin ], $meta_description );
         }
     }
@@ -983,11 +1043,25 @@ class Makasete_REST_Controller {
             }
         }
         if ( isset( $params['seo_title'] ) || isset( $params['meta_description'] ) ) {
-            $this->sync_seo_meta(
-                $post_id,
-                isset( $params['seo_title'] ) ? sanitize_text_field( $params['seo_title'] ) : null,
-                isset( $params['meta_description'] ) ? sanitize_textarea_field( $params['meta_description'] ) : null
-            );
+            $seo_title_arg = isset( $params['seo_title'] )
+                ? sanitize_text_field( $params['seo_title'] )
+                : null;
+            $meta_desc_arg = isset( $params['meta_description'] )
+                ? sanitize_textarea_field( $params['meta_description'] )
+                : null;
+            // On the create path the publisher may send an empty value
+            // when the article plan didn't include one — don't blow
+            // away whatever the user has in their SEO plugin. On an
+            // update the editor sidebar is the explicit source of
+            // truth; an empty string means "clear it" and must be
+            // honoured, otherwise the field appears not to sync.
+            if ( ! $is_update ) {
+                if ( $seo_title_arg === '' ) { $seo_title_arg = null; }
+                if ( $meta_desc_arg === '' ) { $meta_desc_arg = null; }
+            }
+            if ( $seo_title_arg !== null || $meta_desc_arg !== null ) {
+                $this->sync_seo_meta( $post_id, $seo_title_arg, $meta_desc_arg );
+            }
         }
         if ( ! empty( $params['language'] ) ) {
             $this->set_post_language( $post_id, $post_type, (string) $params['language'] );
@@ -1383,13 +1457,57 @@ class Makasete_REST_Controller {
             $rewrite_count  = (int) get_post_meta( $post_id, '_makasete_rewrite_count', true );
         }
 
+        // Echo back the actual saved values from each storage layer so
+        // the backend can verify the round trip in a single hop and
+        // pinpoint *which* layer dropped the write when a silent
+        // failure occurs. Before this echo, the backend had to issue a
+        // follow-up GET /posts/{id} and even then could only read the
+        // SEO-plugin-resolved value via read_seo_meta() — not the
+        // post_excerpt column or our own _makasete_meta_description.
+        // Without those breakdowns the backend's mismatch capture
+        // could only say "value not saved", not "value saved to X but
+        // not Y". The fields are added unconditionally so older
+        // backends just ignore them and newer backends key off their
+        // presence to skip the follow-up GET.
+        $seo_meta = $this->read_seo_meta( $post_id );
         return rest_ensure_response( [
-            'id'                => $post_id,
-            'updated'           => (int) $result === $post_id,
-            'link'              => get_permalink( $post_id ),
-            'last_rewritten_at' => $last_rewritten !== '' ? $last_rewritten : null,
-            'rewrite_count'     => $rewrite_count,
+            'id'                       => $post_id,
+            'updated'                  => (int) $result === $post_id,
+            'link'                     => get_permalink( $post_id ),
+            'last_rewritten_at'        => $last_rewritten !== '' ? $last_rewritten : null,
+            'rewrite_count'            => $rewrite_count,
+            // ── Layer breakdown for silent-drop diagnostics ──────────
+            // Each field reads from a distinct storage location so a
+            // Sentry event can say which one ended up at the user-typed
+            // value and which didn't. Order matches the publish chain:
+            //   _makasete_meta_description -> our own custom meta key
+            //   post_excerpt              -> the wp_posts column
+            //   the_excerpt()             -> what themes typically render
+            //   read_seo_meta()           -> Yoast / Rank Math resolved value
+            'saved_meta_description'   => (string) get_post_meta( $post_id, '_makasete_meta_description', true ),
+            'saved_post_excerpt'       => (string) get_post_field( 'post_excerpt', $post_id ),
+            'saved_excerpt_rendered'   => $this->safe_get_excerpt( $post_id ),
+            'saved_seo_plugin_meta'    => $seo_meta,  // {seo_title, meta_description}
+            'seo_plugin'               => $this->detect_seo_plugin(),
         ] );
+    }
+
+    /**
+     * Wrapper around get_the_excerpt() that won't fatal if a theme's
+     * filter chain blows up. The echo is a diagnostic field, not the
+     * primary update result, so a broken theme filter must not take
+     * down a REST response that the editor save path depends on.
+     */
+    private function safe_get_excerpt( int $post_id ): string {
+        try {
+            $post = get_post( $post_id );
+            if ( ! $post ) {
+                return '';
+            }
+            return (string) get_the_excerpt( $post );
+        } catch ( \Throwable $e ) {
+            return '';
+        }
     }
 
     /**
@@ -1528,6 +1646,85 @@ class Makasete_REST_Controller {
         }
 
         return rest_ensure_response( $this->format_post( get_post( $new_id ) ) );
+    }
+
+    public function update_post_status( WP_REST_Request $request ) {
+        $post_id = (int) $request->get_param( 'id' );
+        $status  = sanitize_key( (string) $request->get_param( 'status' ) );
+
+        $post = get_post( $post_id );
+        if ( ! $post || ! $this->is_allowed_post_type( $post->post_type ) ) {
+            return new WP_Error( 'not_found', __( 'Post not found', 'makasete-seo' ), [ 'status' => 404 ] );
+        }
+
+        $result = wp_update_post( [ 'ID' => $post_id, 'post_status' => $status ], true );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+
+        return rest_ensure_response( [
+            'id'     => $post_id,
+            'status' => get_post_status( $post_id ),
+            'link'   => get_permalink( $post_id ),
+        ] );
+    }
+
+    public function self_update_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $download_url = esc_url_raw( (string) $request->get_param( 'download_url' ) );
+
+        // Only allow downloads from known Makasete-operated hosts. The filter
+        // lets self-hosted deployments add their own origin without forking.
+        $allowed_hosts = apply_filters(
+            'makasete_allowed_update_hosts',
+            [ 'app.makasete.app', 'api.makasete.app' ]
+        );
+        $host = (string) parse_url( $download_url, PHP_URL_HOST );
+        if ( ! in_array( $host, $allowed_hosts, true ) ) {
+            return new WP_Error(
+                'forbidden_update_host',
+                __( 'Plugin update rejected: download URL is not from an allowed host.', 'makasete-seo' ),
+                [ 'status' => 403 ]
+            );
+        }
+
+        if ( ! function_exists( 'request_filesystem_credentials' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+        if ( ! class_exists( 'WP_Upgrader' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        }
+        if ( ! function_exists( 'get_plugin_data' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        // Initialise the filesystem. Only proceed when WordPress can write
+        // directly (method = 'direct'). SSH/FTP would require an interactive
+        // credentials prompt that has no place in a REST handler.
+        WP_Filesystem();
+        global $wp_filesystem;
+        if ( ! $wp_filesystem || ! is_a( $wp_filesystem, 'WP_Filesystem_Direct' ) ) {
+            return new WP_Error(
+                'filesystem_unavailable',
+                __( 'Plugin update requires direct filesystem access. Please update the plugin manually via the WordPress admin.', 'makasete-seo' ),
+                [ 'status' => 503 ]
+            );
+        }
+
+        $upgrader = new Plugin_Upgrader( new WP_Ajax_Upgrader_Skin() );
+        $result   = $upgrader->install( $download_url, [ 'overwrite_package' => true ] );
+
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        if ( $result === false || $result === null ) {
+            return new WP_Error(
+                'update_failed',
+                __( 'Plugin update failed. Please try again or update manually via the WordPress admin.', 'makasete-seo' ),
+                [ 'status' => 500 ]
+            );
+        }
+
+        return rest_ensure_response( [ 'success' => true ] );
     }
 
     public function delete_post( WP_REST_Request $request ) {
