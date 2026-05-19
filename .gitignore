@@ -1,3 +1,6 @@
+# Claude Code session data
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
